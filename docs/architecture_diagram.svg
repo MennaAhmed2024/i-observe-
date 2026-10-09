@@ -1,0 +1,220 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 1200" font-family="Inter, Segoe UI, system-ui, sans-serif" style="background:#F8F9FA">
+  <rect width="1300" height="1200" fill="#F8F9FA"/>
+  <rect x="20" y="20" width="1260" height="1160" rx="0" fill="none" stroke="#1E293B" stroke-width="2"/>
+
+  <defs>
+    <marker id="reqArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,4 L6,4 L6,2 L6,6 L0,4" fill="#1E293B" stroke="#1E293B" stroke-width="1.5"/>
+    </marker>
+    <marker id="resArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,4 L6,4 L6,2 L6,6 L0,4" fill="#64748B" stroke="#64748B" stroke-width="1.2"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="650" y="65" text-anchor="middle" fill="#0F172A" font-size="20" font-weight="800" letter-spacing="-0.3">I-Observe Architecture — Sequence Diagram</text>
+  <text x="650" y="85" text-anchor="middle" fill="#64748B" font-size="12">Face Recognition &amp; Video Intelligence Pipeline</text>
+
+  <!-- Legend -->
+  <rect x="40" y="98" width="260" height="24" rx="6" fill="#F1F5F9" stroke="#CBD5E1"/>
+  <line x1="48" y1="114" x2="78" y2="114" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+  <text x="85" y="118" fill="#64748B" font-size="10">Request</text>
+  <line x1="145" y1="114" x2="175" y2="114" stroke="#64748B" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#resArrow)"/>
+  <text x="182" y="118" fill="#64748B" font-size="10">Response/Event</text>
+
+  <!-- Column positions (8 columns) -->
+  <!-- C1=130, C2=270, C3=410, C4=550, C5=690, C6=830, C7=970, C8=1110 -->
+  <!-- Each column: 130 wide, center at col+65 -->
+
+  <!-- HEADERS -->
+  <g id="headers">
+    <!-- Col 1: Camera -->
+    <rect x="55" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="130" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">📷 Camera</text>
+
+    <!-- Col 2: Browser -->
+    <rect x="195" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="270" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">🌐 Browser UI</text>
+
+    <!-- Col 3: FastAPI -->
+    <rect x="335" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="410" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">⚡ FastAPI</text>
+
+    <!-- Col 4: YOLO11 -->
+    <rect x="475" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="550" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">YOLO11 Face</text>
+
+    <!-- Col 5: MiniFASNet -->
+    <rect x="615" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="690" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">MiniFASNetV2</text>
+
+    <!-- Col 6: ArcFace -->
+    <rect x="755" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="830" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">ArcFace 512-D</text>
+
+    <!-- Col 7: TurboVec -->
+    <rect x="895" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="970" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">TurboVec</text>
+
+    <!-- Col 8: PostgreSQL -->
+    <rect x="1035" y="135" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="1110" y="154" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">PostgreSQL</text>
+  </g>
+
+  <!-- LIFELINES (vertical dashed lines) -->
+  <g stroke="#B3A7FF" stroke-width="1.2" stroke-dasharray="5,5">
+    <line x1="130" y1="170" x2="130" y2="1100"/>
+    <line x1="270" y1="170" x2="270" y2="1100"/>
+    <line x1="410" y1="170" x2="410" y2="1100"/>
+    <line x1="550" y1="170" x2="550" y2="1100"/>
+    <line x1="690" y1="170" x2="690" y2="1100"/>
+    <line x1="830" y1="170" x2="830" y2="1100"/>
+    <line x1="970" y1="170" x2="970" y2="1100"/>
+    <line x1="1110" y1="170" x2="1110" y2="1100"/>
+  </g>
+
+  <!-- ====== SEQUENCE FLOW ====== -->
+  <g font-size="10">
+
+    <!-- ▸ 1. Camera → Browser (video stream) -->
+    <line x1="130" y1="200" x2="270" y2="200" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="200" y="195" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">1</text>
+    <text x="210" y="205" text-anchor="middle" fill="#1E293B" font-size="10">Video frames</text>
+
+    <!-- ▸ 2. Browser → FastAPI (frame for detection) -->
+    <line x1="270" y1="235" x2="410" y2="235" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="340" y="230" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">2</text>
+    <text x="350" y="240" text-anchor="middle" fill="#1E293B" font-size="10">POST /api/camera/detect</text>
+
+    <!-- ▸ 3. FastAPI → FastAPI (self: analyse_faces) -->
+    <path d="M 410 265 Q 440 260 480 270" fill="none" stroke="#1E293B" stroke-width="2"/>
+    <line x1="480" y1="270" x2="410" y2="280" stroke="#1E293B" stroke-width="2"/>
+    <text x="340" y="278" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">3</text>
+    <text x="360" y="290" text-anchor="middle" fill="#1E293B" font-size="10">analyse_faces()</text>
+
+    <!-- ▸ 4. FastAPI → YOLO11 (detect) -->
+    <line x1="410" y1="310" x2="550" y2="310" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="480" y="305" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">4</text>
+    <text x="490" y="315" text-anchor="middle" fill="#1E293B" font-size="10">Detect faces</text>
+
+    <!-- ▸ 5. YOLO11 → FastAPI (response) -->
+    <line x1="550" y1="340" x2="410" y2="340" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="480" y="335" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">5</text>
+    <text x="490" y="345" text-anchor="middle" fill="#64748B" font-size="10">Faces + landmarks</text>
+
+    <!-- ▸ 6. FastAPI → MiniFASNet (liveness) -->
+    <line x1="410" y1="375" x2="690" y2="375" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="550" y="370" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">6</text>
+    <text x="560" y="380" text-anchor="middle" fill="#1E293B" font-size="10">Check liveness</text>
+
+    <!-- ▸ 7. MiniFASNet → FastAPI (response) -->
+    <line x1="690" y1="405" x2="410" y2="405" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="550" y="400" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">7</text>
+    <text x="560" y="410" text-anchor="middle" fill="#64748B" font-size="10">Live/spoof score</text>
+
+    <!-- ▸ 8. FastAPI → ArcFace (embed) -->
+    <line x1="410" y1="440" x2="830" y2="440" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="620" y="435" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">8</text>
+    <text x="630" y="445" text-anchor="middle" fill="#1E293B" font-size="10">Generate embedding</text>
+
+    <!-- ▸ 9. ArcFace → FastAPI (response) -->
+    <line x1="830" y1="470" x2="410" y2="470" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="620" y="465" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">9</text>
+    <text x="630" y="475" text-anchor="middle" fill="#64748B" font-size="10">512-D vector</text>
+
+    <!-- ▸ 10. FastAPI → TurboVec (search) -->
+    <line x1="410" y1="505" x2="970" y2="505" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="690" y="500" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">10</text>
+    <text x="700" y="510" text-anchor="middle" fill="#1E293B" font-size="10">Search identity</text>
+
+    <!-- ▸ 11. TurboVec → FastAPI (response) -->
+    <line x1="970" y1="535" x2="410" y2="535" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="690" y="530" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">11</text>
+    <text x="700" y="540" text-anchor="middle" fill="#64748B" font-size="10">Top match + score</text>
+
+    <!-- ▸ 12. FastAPI → FastAPI (self: compose response) -->
+    <path d="M 410 570 Q 440 565 480 575" fill="none" stroke="#1E293B" stroke-width="2"/>
+    <line x1="480" y1="575" x2="410" y2="585" stroke="#1E293B" stroke-width="2"/>
+    <text x="340" y="580" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">12</text>
+    <text x="350" y="592" text-anchor="middle" fill="#1E293B" font-size="10">Compose result</text>
+
+    <!-- ▸ 13. FastAPI → PostgreSQL (save) -->
+    <line x1="410" y1="615" x2="1110" y2="615" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="760" y="610" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">13</text>
+    <text x="770" y="620" text-anchor="middle" fill="#1E293B" font-size="10">Save event</text>
+
+    <!-- ▸ 14. PostgreSQL → FastAPI (confirmed) -->
+    <line x1="1110" y1="645" x2="410" y2="645" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="760" y="640" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">14</text>
+    <text x="770" y="650" text-anchor="middle" fill="#64748B" font-size="10">Event saved</text>
+
+    <!-- ▸ 15. FastAPI → Browser (response) -->
+    <line x1="410" y1="680" x2="270" y2="680" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="340" y="675" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">15</text>
+    <text x="350" y="685" text-anchor="middle" fill="#64748B" font-size="10">JSON: faces + identities + objects + fps</text>
+
+    <!-- ▸ 16. Browser draws boxes (self) -->
+    <path d="M 270 710 Q 300 705 340 715" fill="none" stroke="#1E293B" stroke-width="2"/>
+    <line x1="340" y1="715" x2="270" y2="725" stroke="#1E293B" stroke-width="2"/>
+    <text x="210" y="722" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">16</text>
+    <text x="220" y="734" text-anchor="middle" fill="#1E293B" font-size="10">Draw boxes overlay</text>
+
+    <!-- separator line -->
+    <line x1="40" y1="760" x2="1260" y2="760" stroke="#CBD5E1" stroke-width="1"/>
+    <text x="650" y="775" text-anchor="middle" fill="#64748B" font-size="12" font-weight="600">Query Flow</text>
+
+    <!-- ▸ 17. Browser → FastAPI (user asks) -->
+    <line x1="270" y1="800" x2="410" y2="800" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="340" y="795" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">17</text>
+    <text x="350" y="805" text-anchor="middle" fill="#1E293B" font-size="10">POST /query</text>
+
+    <!-- ▸ 18. FastAPI → PostgreSQL (search) -->
+    <line x1="410" y1="835" x2="1110" y2="835" stroke="#1E293B" stroke-width="2" marker-end="url(#reqArrow)"/>
+    <text x="760" y="830" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">18</text>
+    <text x="770" y="840" text-anchor="middle" fill="#1E293B" font-size="10">Search timeline</text>
+
+    <!-- ▸ 19. PostgreSQL → FastAPI (results) -->
+    <line x1="1110" y1="865" x2="410" y2="865" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="760" y="860" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">19</text>
+    <text x="770" y="870" text-anchor="middle" fill="#64748B" font-size="10">Matched events</text>
+
+    <!-- ▸ 20. FastAPI → FastAPI (self: answer with VLM) -->
+    <path d="M 410 895 Q 440 890 480 900" fill="none" stroke="#1E293B" stroke-width="2"/>
+    <line x1="480" y1="900" x2="410" y2="910" stroke="#1E293B" stroke-width="2"/>
+    <text x="340" y="905" text-anchor="middle" fill="#1E293B" font-size="10" font-weight="700">20</text>
+    <text x="350" y="915" text-anchor="middle" fill="#1E293B" font-size="10">VLM answer()</text>
+
+    <!-- ▸ 21. FastAPI → Browser (final response) -->
+    <line x1="410" y1="940" x2="270" y2="940" stroke="#64748B" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#resArrow)"/>
+    <text x="340" y="935" text-anchor="middle" fill="#64748B" font-size="10" font-weight="700">21</text>
+    <text x="350" y="945" text-anchor="middle" fill="#64748B" font-size="10">JSON: answer + evidence + events</text>
+
+  </g>
+
+  <!-- FOOTERS (same as headers) -->
+  <g id="footers">
+    <rect x="55" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="130" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">📷 Camera</text>
+
+    <rect x="195" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="270" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">🌐 Browser UI</text>
+
+    <rect x="335" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="410" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">⚡ FastAPI</text>
+
+    <rect x="475" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="550" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">YOLO11 Face</text>
+
+    <rect x="615" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="690" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">MiniFASNetV2</text>
+
+    <rect x="755" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="830" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">ArcFace 512-D</text>
+
+    <rect x="895" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="970" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">TurboVec</text>
+
+    <rect x="1035" y="1080" width="150" height="34" rx="8" fill="#EBE5FF" stroke="#B3A7FF" stroke-width="1.5"/>
+    <text x="1110" y="1099" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="700">PostgreSQL</text>
+  </g>
+</svg>

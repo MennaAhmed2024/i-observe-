@@ -24,6 +24,16 @@ if ($busy) {
   Info "no web console was listening on $port"
 }
 
+# 1b. the dashboard assistant (assistant-ui / Next.js)
+$asstPort = 3100
+$asst = Get-NetTCPConnection -LocalPort $asstPort -State Listen -ErrorAction SilentlyContinue
+if ($asst) {
+  $asst | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+  Ok "dashboard assistant on port $asstPort stopped"
+} else {
+  Info "no dashboard assistant was listening on $asstPort"
+}
+
 # 2. the S3-compatible evidence endpoint started by start_iobserve.ps1
 $moto = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*moto.server*' }

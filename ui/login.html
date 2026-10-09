@@ -58,7 +58,7 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 let mode='login';
 function setMode(m){mode=m;$('#tLogin').classList.toggle('on',m==='login');$('#tReg').classList.toggle('on',m==='register');
  $('#go').textContent=m==='login'?'SIGN IN':'CREATE ACCOUNT';
- $('#hint').textContent=m==='login'?'Registered operators sign in to open the console.':'3-32 chars (letters, digits, . _ -) · password 8+ chars.';$('#m').className='msg';}
+ $('#hint').textContent=m==='login'?'Registered operators sign in to open the console.':'.';$('#m').className='msg';}
 $('#tLogin').addEventListener('click',()=>setMode('login'));
 $('#tReg').addEventListener('click',()=>setMode('register'));
 async function submit(){

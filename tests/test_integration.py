@@ -226,21 +226,27 @@ def test_pipeline_integrations_are_actually_used(tmp_path):
                 if p is None:
                     missing.append(s[0])
                     continue
-                for idx, name in ((7, "action"), (8, "action_score"), (9, "vlm")):
+                # Column order in BOTH stores is
+                #   id,track_id,ts,wall_ts,event_type,shirt_color,identity,identity_score,
+                #   action,action_score,vlm,evidence,clip,video
+                # so action=8, action_score=9, vlm=10, evidence=11, clip=12, video=13.
+                # This block used 7/8/9 and 11, i.e. identity_score/action/action_score and
+                # evidence - so it never actually compared the fields it claimed to check.
+                for idx, name in ((8, "action"), (9, "action_score"), (10, "vlm")):
                     if s[idx] != p[idx]:
                         mismatched.append((s[0], name, s[idx], p[idx]))
                 # Clips are compared by file name: the name encodes video+track+timestamp
                 # and is stable across runs, while the directory is the per-run tmp_path.
-                if (s[11] is None) != (p[11] is None):
-                    mismatched.append((s[0], "clip", s[11], p[11]))
-                elif s[11] and Path(s[11]).name != Path(p[11]).name:
-                    mismatched.append((s[0], "clip", Path(s[11]).name, Path(p[11]).name))
+                if (s[12] is None) != (p[12] is None):
+                    mismatched.append((s[0], "clip", s[12], p[12]))
+                elif s[12] and Path(s[12]).name != Path(p[12]).name:
+                    mismatched.append((s[0], "clip", Path(s[12]).name, Path(p[12]).name))
             assert not missing, f"{len(missing)} sqlite rows missing from the Postgres mirror: {missing[:5]}"
             assert not mismatched, (
                 "Postgres mirror did not carry the same values as SQLite (action/vlm/clip "
                 f"were being dropped): {mismatched[:5]}"
             )
-            assert any(r[11] for r in sqlite_rows), "this run must produce at least one evidence clip"
+            assert any(r[12] for r in sqlite_rows), "this run must produce at least one evidence clip"
         finally:
             pg.close()
 

@@ -26,6 +26,7 @@ import numpy as np
 
 from vision_core import (
     EvidenceWriter,
+    Face,
     MiniFASNet,
     OnnxEmbedder512,
     TurboVecFaceIndex,
@@ -34,6 +35,11 @@ from vision_core import (
     align_face,
     expanded_crop,
 )
+
+try:
+    from qdrant_client import QdrantClient, models as qmodels
+except ImportError:  # pragma: no cover - exercised only on missing dependency
+    QdrantClient = qmodels = None
 
 _YOLO = None
 _YOLO_ERROR = None
@@ -243,7 +249,7 @@ class EventStore:
         """Query by real-world time, which is what 'yesterday' or 'today' means."""
         q = (
             "SELECT id,track_id,ts,wall_ts,event_type,shirt_color,identity,identity_score,"
-            "action,action_score,vlm,evidence,clip FROM events WHERE wall_ts >= ? AND wall_ts < ?"
+            "action,action_score,vlm,evidence,clip FROM events WHERE wall_ts BETWEEN ? AND ?"
         )
         args = [start_wall, end_wall]
         if color:
@@ -292,6 +298,27 @@ def color_name(crop):
 # --------------------------------------------------------------------------------------
 # Vector index
 # --------------------------------------------------------------------------------------
+
+
+class VectorIndex:
+    """Persistent local Qdrant-compatible index for track-level embeddings."""
+
+    def __init__(self, path="qdrant_storage", dim=512, collection="face_events"):
+        if QdrantClient is None:
+            raise RuntimeError("Install qdrant-client")
+        self.client = QdrantClient(path=path)
+        self.name = collection
+        if not self.client.collection_exists(self.name):
+            self.client.create_collection(
+                self.name,
+                vectors_config=qmodels.VectorParams(size=dim, distance=qmodels.Distance.COSINE),
+            )
+
+    def upsert(self, point_id, vector, payload):
+        self.client.upsert(self.name, [qmodels.PointStruct(id=point_id, vector=vector, payload=payload)])
+
+    def search(self, vector, limit=5):
+        return self.client.query_points(self.name, query=vector, limit=limit).points
 
 
 # --------------------------------------------------------------------------------------
@@ -435,7 +462,7 @@ class OptionalVideoMAE:
 
 
 class OptionalVLM:
-    """VLM describer built from the configured provider (ollama / openai / openrouter).
+    """VLM describer built from the configured provider ( openrouter).
 
     Reports unavailability instead of returning a fake answer.
     """
@@ -471,7 +498,7 @@ class OptionalVLM:
 
 
 class FaceIdentifier:
-    """YOLO11 Face detect -> align -> MiniFASNet gate -> ArcFace -> TurboVec.
+    """YOLO11 Face -> align -> MiniFASNet gate -> ArcFace -> TurboVec identity.
 
     The embedder and the vector-index dimension both come from ``config`` so swapping
     models is a single environment variable rather than an edit here.
@@ -480,11 +507,11 @@ class FaceIdentifier:
     def __init__(self, status: IntegrationStatus, live_threshold: float = 0.5):
         import config
 
-        self.detector = YOLO11FaceDetector(str(config.YOLO_FACE_MODEL))
+        self.detector = YOLO11FaceDetector(
+            str(config.YOLO_FACE_MODEL), image_size=config.YOLO_FACE_IMAGE_SIZE
+        )
         self.liveness = MiniFASNet(str(config.LIVENESS_PATH), threshold=live_threshold)
         self.embedder = OnnxEmbedder512(str(config.embedder_path()))
-        if self.embedder.dim != 512:
-            raise RuntimeError(f"Active ArcFace model must output 512-D, got {self.embedder.dim}")
         self.index = TurboVecFaceIndex(path=config.TURBOVEC_PATH, dim=self.embedder.dim)
         self.stabilizer = TrackIdentityStabilizer(self.index)
         info = config.embedder_info()
@@ -492,55 +519,61 @@ class FaceIdentifier:
             "face_stack",
             True,
             f"YOLO11 Face + MiniFASNetV2 + {info['name']} ({self.embedder.dim}-D, {info['license']}) "
-            f"+ TurboVec ({self.index.dim}-D, threshold={self.index.threshold:.3f})",
+            "+ TurboVec",
         )
         status.record("embedder_license", True, info["license"])
-    def evaluate_all(self, frame, track_id):
-        """Process EVERY face in the frame, independently.
 
-        Each face gets its own bbox, liveness verdict, embedding, TurboVec lookup and
-        identity, and each is associated with its own track. A spoof or failing face
-        never prevents the remaining faces from being recognised.
-        """
-        faces = self.detector.detect(frame)
+    def evaluate(self, frame, track_id, person_bbox=None):
+        ox = oy = 0
+        target = frame
+        if person_bbox:
+            x1, y1, x2, y2 = [int(v) for v in person_bbox]
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+            if x2 > x1 and y2 > y1:
+                target, ox, oy = frame[y1:y2, x1:x2], x1, y1
+        faces = self.detector.detect(target)
         if not faces:
-            return []
-        out = []
-        for i, face in enumerate(faces):
-            x1, y1, x2, y2 = [int(round(float(v))) for v in face.bbox]
-            try:
-                detail = self.liveness.predict_detailed(expanded_crop(frame, face.bbox))
-            except Exception as exc:
-                out.append({"identity": "liveness_error", "score": 0.0, "live": False,
-                             "liveness_score": 0.0, "bbox": [x1, y1, x2, y2], "face_index": i,
-                             "error": str(exc)})
-                continue
-            if not detail["live"]:
-                out.append({"identity": "spoof_rejected", "score": 0.0, "live": False,
-                         "liveness_score": detail["live_score"],
-                         "spoof_score": detail["spoof_score"],
-                         "bbox": [x1, y1, x2, y2], "face_index": i})
-                continue
-            try:
-                vector = self.embedder.embed(self.embedder.align(frame, face))
-            except Exception as exc:
-                out.append({"identity": "alignment_error", "score": 0.0, "live": True,
-                         "liveness_score": detail["live_score"], "bbox": [x1, y1, x2, y2],
-                         "face_index": i, "error": str(exc)})
-                continue
-            # a distinct sub-track per face keeps identities from being merged
-            stable = self.stabilizer.update(f"{track_id}#{i}", vector, quality=float(face.confidence))
-            out.append({
-                "identity": stable["identity"],
-                "score": stable["score"],
-                "live": True,
+            return {"identity": "no_face", "score": 0.0, "live": False, "liveness_score": 0.0, "bbox": None}
+        face = max(faces, key=lambda f: f.confidence)
+        if ox or oy:
+            face = Face(
+                face.bbox + np.array([ox, oy, ox, oy], np.float32),
+                face.landmarks + np.array([ox, oy], np.float32),
+                face.confidence,
+            )
+        x1, y1, x2, y2 = map(int, face.bbox)
+        detail = self.liveness.predict_detailed(expanded_crop(frame, face.bbox))
+        if not detail["live"]:
+            return {
+                "identity": "spoof_rejected",
+                "score": 0.0,
+                "live": False,
                 "liveness_score": detail["live_score"],
                 "spoof_score": detail["spoof_score"],
                 "bbox": [x1, y1, x2, y2],
-                "face_index": i,
-                "track_updates": stable["updates"],
-            })
-        return out
+            }
+        try:
+            vector = self.embedder.embed(self.embedder.align(frame, face))
+        except Exception as exc:
+            return {
+                "identity": "alignment_error",
+                "score": 0.0,
+                "live": True,
+                "liveness_score": detail["live_score"],
+                "bbox": [x1, y1, x2, y2],
+                "error": str(exc),
+            }
+        stable = self.stabilizer.update(track_id, vector, quality=float(face.confidence))
+        return {
+            "identity": stable["identity"],
+            "score": stable["score"],
+            "live": True,
+            "liveness_score": detail["live_score"],
+            "spoof_score": detail["spoof_score"],
+            "bbox": [x1, y1, x2, y2],
+            "track_updates": stable["updates"],
+        }
 
 
 # --------------------------------------------------------------------------------------
@@ -648,11 +681,8 @@ def process(
             if near:
                 action = f"{action} near {', '.join(sorted(set(near))[:3])}"
 
-            # ---- face identity + liveness (stages 1-5) ----------------------------
-            # Every face in the frame is processed independently; one person per event.
-            face_infos = face_identifier.evaluate_all(frame, track) or [
-                {"identity": "no_face", "score": 0.0, "live": False, "liveness_score": 0.0, "bbox": None, "face_index": 0}
-            ]
+            # ---- face identity + liveness (stages 1-5) -----------------------------
+            face_info = face_identifier.evaluate(frame, track, box)
 
             # ---- evidence frame ----------------------------------------------------
             evidence_path = evidence.frame(video_id, track, ts, frame, box)
@@ -664,85 +694,98 @@ def process(
             if len(frame_buffer) == 16 and (frame_no // max(1, int(fps // sample_fps))) % 8 == 0:
                 predictions = action_model.predict(frame_buffer, top_k=1)
                 if predictions:
+                    # Count only windows that actually produced a label, so the report
+                    # cannot claim action recognition ran when the model was unavailable.
                     videomae_windows += 1
                     action_label = predictions[0]["label"]
                     action_score = float(predictions[0]["score"])
 
+            # ---- VLM description --------------------------------------------------
+            vlm_text = None
+            if face_info["live"] and vlm_count < vlm_every * 3:
+                vlm_text = vlm.describe(
+                    [evidence_path],
+                    "Describe what this person is doing and wearing. Reference timestamps as video offsets.",
+                )
+                if vlm_text:
+                    vlm_count += 1
+
             # ---- incident rules -> evidence clip ----------------------------------
             event_type = action_label or action
+            probe = {
+                "shirt_color": color,
+                "event_type": event_type,
+                "identity": face_info["identity"],
+            }
+            matched_rules = rules.evaluate(probe) if rules else []
+            clip_path = None
+            if matched_rules:
+                try:
+                    from evidence_clips import extract_clip
 
-            for face_info in face_infos:
-                probe = {"shirt_color": color, "event_type": event_type,
-                        "identity": face_info["identity"]}
-                matched_rules = rules.evaluate(probe) if rules else []
-                clip_path = None
-                if matched_rules:
-                    try:
-                        from evidence_clips import extract_clip
-
-                        clip_name = f"{video_id}_track{track}_f{face_info.get('face_index', 0)}_{int(ts * 1000):07d}.mp4"
-                        clip_path = extract_clip(
-                            video, max(0.0, ts - clip_pad), ts + clip_pad, str(Path(clip_dir) / clip_name)
-                        )
-                        object_store.upload(clip_path, f"{video_id}/clips/{clip_name}")
-                        clip_count += 1
-                    except Exception as exc:
-                        clip_path = f"[clip extraction failed: {type(exc).__name__}: {exc}]"
-
-                # ---- VLM description (per face, throttled) ----------------------
-                vlm_text = None
-                if face_info["live"] and vlm_count < vlm_every * 3:
-                    vlm_text = vlm.describe(
-                        [evidence_path],
-                        "Describe what this person is doing and wearing. Reference timestamps as video offsets.",
+                    clip_name = f"{video_id}_track{track}_{int(ts * 1000):07d}.mp4"
+                    clip_path = extract_clip(
+                        video, max(0.0, ts - clip_pad), ts + clip_pad, str(Path(clip_dir) / clip_name)
                     )
-                    if vlm_text:
-                        vlm_count += 1
+                    object_store.upload(clip_path, f"{video_id}/clips/{clip_name}")
+                    clip_count += 1
+                except Exception as exc:
+                    clip_path = f"[clip extraction failed: {type(exc).__name__}: {exc}]"
 
-                proof = {
-                    "frame": frame_no,
-                    "timestamp": ts,
-                    "timestamp_hms": format_ts(ts),
-                    "bbox": face_info.get("bbox") or box,
-                    "person_bbox": box,
-                    "face_index": face_info.get("face_index", 0),
-                    "color": color,
-                    "objects": near,
-                    "path": evidence_path,
-                    "clip": clip_path,
-                    "rules": [r.get("id") for r in matched_rules],
-                }
+            proof = {
+                "frame": frame_no,
+                "timestamp": ts,
+                "timestamp_hms": format_ts(ts),
+                "bbox": box,
+                "color": color,
+                "objects": near,
+                "path": evidence_path,
+                "clip": clip_path,
+                "rules": [r.get("id") for r in matched_rules],
+            }
 
-                # uuid5 keyed on the face index too, so two people in one frame
-                # never collide onto a single event id
-                event_id = str(
-                    uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        f"{Path(video).resolve()}|{track}|f{face_info.get('face_index', 0)}|{frame_no}|{event_type}",
-                    )
+            event_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{Path(video).resolve()}|{track}|{frame_no}|{event_type}",
                 )
-                store.add(
-                    id=event_id, video=str(video), track_id=track, ts=ts,
-                    event_type=event_type, shirt_color=color,
-                    identity=face_info["identity"],
-                    identity_score=float(face_info.get("score", 0.0)),
-                    action=action_label, action_score=float(action_score),
-                    vlm=vlm_text, bbox=face_info.get("bbox") or box,
-                    evidence=proof, clip=clip_path,
-                )
-                postgres.add(
-                    id=event_id, video=str(video), track_id=track, ts=ts,
-                    event_type=event_type, shirt_color=color,
-                    identity=face_info["identity"],
-                    identity_score=float(face_info.get("score", 0.0)),
-                    action=action_label, action_score=float(action_score),
-                    vlm=vlm_text, bbox=face_info.get("bbox") or box,
-                    evidence=proof, clip=clip_path,
-                )
-                records.append({
+            )
+            store.add(
+                id=event_id,
+                video=str(video),
+                track_id=track,
+                ts=ts,
+                event_type=event_type,
+                shirt_color=color,
+                identity=face_info["identity"],
+                identity_score=float(face_info.get("score", 0.0)),
+                action=action_label,
+                action_score=float(action_score),
+                vlm=vlm_text,
+                bbox=box,
+                evidence=proof,
+                clip=clip_path,
+            )
+            postgres.add(
+                id=event_id,
+                video=str(video),
+                track_id=track,
+                ts=ts,
+                event_type=event_type,
+                shirt_color=color,
+                identity=face_info["identity"],
+                identity_score=float(face_info.get("score", 0.0)),
+                action=action_label,
+                action_score=float(action_score),
+                vlm=vlm_text,
+                bbox=box,
+                evidence=proof,
+                clip=clip_path,
+            )
+            records.append(
+                {
                     "id": event_id,
                     "track_id": track,
-                    "face_index": face_info.get("face_index", 0),
                     "event": event_type,
                     "ts": ts,
                     "ts_hms": format_ts(ts),
@@ -750,10 +793,10 @@ def process(
                     "identity_score": float(face_info.get("score", 0.0)),
                     "live": face_info.get("live"),
                     "liveness_score": float(face_info.get("liveness_score", 0.0)),
-                    "face_bbox": face_info.get("bbox"),
                     "clip": clip_path,
                     **proof,
-                })
+                }
+            )
 
     cap.release()
     manifest_path = evidence.manifest(video_id, records)
@@ -782,111 +825,6 @@ def process(
 
 _TIME_TOKEN = r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b"
 
-# --------------------------------------------------------------------------------------
-# Arabic / Egyptian Arabic support
-# --------------------------------------------------------------------------------------
-
-ARABIC_DIGITS = {"٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-                 "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9"}
-
-ARABIC_RANGE_WORDS = {
-    "النهارده": "today", "النهاردة": "today", "اليوم": "today", "امبارح": "yesterday",
-    "البارحه": "yesterday", "من امبارح": "yesterday", "بعدين": "today",
-}
-
-# Transliterations for common Arabic name spellings -> Latin. Used only to match a query
-# against already-enrolled identities; nothing stored in Qdrant/PostgreSQL is renamed.
-NAME_TRANSLITERATIONS = {
-    "منة": "menna", "مenna": "menna", "منه": "menna", "مينا": "menna", "مينه": "menna",
-    "أحمد": "ahmed", "احمد": "ahmed", "آحمد": "ahmed", "hamid": "ahmed", "amed": "ahmed",
-    "علي": "ali", "على": "ali", "عبدالله": "abdullah", "عبد الله": "abdullah",
-    "محمد": "mohamed", "محمود": "mahmoud", "سارة": "sara", "نور": "nour", "نورا": "noura",
-    "يوسف": "yousef", "يحيى": "youssef", "فاطمة": "fatima", "مريم": "maryam",
-    "خالد": "khaled", "كريم": "kareem", "دينا": "dina", "هدى": "hoda", "هالة": "hala",
-    "إيمان": "eman", "ايمان": "eman", "سلمى": "salma", "ريم": "reem", "منى": "mona",
-}
-
-ARABIC_QUESTION_WORDS = (
-    "مين", "مصر", "ايه", "إيه", "امتي", "إمتى", "في", "وهو", "هي", "الفيديو",
-    "بتاع", "بتاعة", "ظهر", "ظهرت", "كان", "يكون", "لحد", "الperiod", "شخص",
-)
-
-
-def normalise_arabic(text: str) -> str:
-    """Fold Arabic-Indic digits and strip diacritics/tatweel so matching is robust."""
-    out = []
-    for ch in text:
-        if ch in ARABIC_DIGITS:
-            out.append(ARABIC_DIGITS[ch])
-        elif ch in ("ً", "ٌ", "ٍ", "َ", "ُ", "ِ", "ّ", "ْ", "ـ"):
-            continue
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def is_arabic_question(question: str) -> bool:
-    q = normalise_arabic(question)
-    if any("\u0600" <= c <= "\u06ff" for c in q):
-        return True
-    return any(w in q.lower() for w in ARABIC_QUESTION_WORDS)
-
-
-def detect_language(question: str) -> str:
-    return "ar" if is_arabic_question(question) else "en"
-
-
-def extract_identities(question: str, known: list[str] | None = None) -> list[str]:
-    """Find identity names mentioned in a question, matching Arabic and Latin spellings.
-
-    Returns canonical names as they are stored, so no stored identity is ever renamed.
-    """
-    q = normalise_arabic(question)
-    low = q.lower()
-    found: list[str] = []
-
-    def add(name):
-        if name and name not in found:
-            found.append(name)
-
-    for ar, latin in NAME_TRANSLITERATIONS.items():
-        if ar in q:
-            canonical = next((name for name in (known or []) if str(name).casefold() == latin.casefold()), latin)
-            add(canonical)
-    for name in known or []:
-        if name and name.lower() in low:
-            add(name)
-    return found
-
-
-def _arabic_number(token: str) -> int:
-    t = normalise_arabic(token)
-    return int(t) if t.isdigit() else 0
-
-
-def _parse_time_range_arabic(question: str) -> tuple[float, float] | None:
-    """Egyptian time expressions: 'بين 2 و 3', 'الساعة 5', 'في الساعة ٢'."""
-    q = normalise_arabic(question)
-    if any(x in q for x in ("امتى", "إمتى", "اخر حد", "آخر حد", "فيديو", "بتعمل ايه", "بتعمل إيه", "ظهر النهارده", "ظهرت النهارده")):
-        return _parse_wall_range(q)
-    wall = _parse_wall_range(q)
-    if wall is not None:
-        return wall
-
-    m = re.search(r"بين\s*(\d{1,2})\s*(?:و|:|إلى|الي)\s*(\d{1,2})", q)
-    if m:
-        a, b = _arabic_number(m.group(1)), _arabic_number(m.group(2))
-        if a > b:
-            a, b = b, a
-        return float(a * 60), float(b * 60)
-
-    m = re.search(r"(?:الساعه|الساعة)\s*(\d{1,2})", q)
-    if m:
-        s = _arabic_number(m.group(1))
-        return float(s * 60), float(s * 60 + 300)
-    return None
-
-
 
 def _parse_time_range(question: str) -> tuple[float, float]:
     """Extract a video-relative time window from natural language.
@@ -913,161 +851,6 @@ def _parse_time_range(question: str) -> tuple[float, float]:
     return min(start, end), max(start, end)
 
 
-def _known_identities(store) -> list[str]:
-    """Identity names actually present in the timeline, plus the vector index."""
-    names: set[str] = set()
-    try:
-        for row in store.all_events():
-            ident = row[6]
-            if ident and ident not in ("unknown", "no_face", "spoof_rejected",
-                                       "align_error", "alignment_error", "liveness_error"):
-                names.add(str(ident))
-    except Exception:
-        pass
-    try:
-        for item in TurboVecFaceIndex(path=config.TURBOVEC_PATH, dim=_current_dim()).list_identities():
-            if item.get("name"):
-                names.add(str(item["name"]))
-    except Exception:
-        pass
-    return sorted(names)
-
-
-def _current_dim() -> int:
-    try:
-        import config as _c
-
-        return int(_c.embedder_info()["dim"])
-    except Exception:
-        return 512
-
-
-_AR_SENTINELS = {
-    "unknown": "Unknown", "no_face": "مفيش وش", "spoof_rejected": "إنتحال مرفوض",
-    "align_error": "محاذاة فاشلة", "alignment_error": "محاذاة فاشلة",
-    "liveness_error": "فشل التحقق", "no data": "مفيش بيانات",
-}
-
-
-def _arabic_answer_text(rows, identity, window, kind: str) -> str:
-    """Compose an Egyptian-Arabic answer from the rows that were actually retrieved."""
-    if not rows:
-        who = f"لـ {identity}" if identity else "بالفترة دي"
-        return f"ملقتش أحداث مسجلة {who} في الفترة دي."
-
-    people: dict[str, int] = {}
-    actions: dict[str, int] = {}
-    times = []
-    for r in rows:
-        ident = r[6]
-        if ident and ident not in ("unknown", "no_face", "spoof_rejected", "align_error"):
-            people[str(ident)] = people.get(str(ident), 0) + 1
-        elif ident:
-            people[_AR_SENTINELS.get(str(ident), "Unknown")] = people.get(
-                _AR_SENTINELS.get(str(ident), "Unknown"), 0) + 1
-        if r[8]:
-            actions[r[8]] = actions.get(r[8], 0) + 1
-        times.append(r[3] or 0)
-
-    stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
-    who_txt = " و".join(f"{k} ({v} مرات)" for k, v in sorted(people.items(), key=lambda kv: -kv[1]))
-    act_txt = "، ".join(sorted(actions, key=lambda a: -actions[a])[:5]) if actions else "مفيش إجراء محدد"
-    first, last = stamp(min(times)), stamp(max(times))
-
-    if kind == "wall":
-        return f"النهارده {first} لحد {last}، سجّلت {len(rows)} مشاهدة. الناس اللي ظهرت: {who_txt}. الأفعال: {act_txt}."
-    if kind == "who":
-        return f"النهارده طلع {who_txt}، والأفعال اللي اتسجّلت: {act_txt}."
-    if kind == "clips":
-        return f"أيوه، فيه {len(rows)} فيديو وحدث متسجل لـ {identity} بين {first} و {last}."
-    if kind == "when":
-        return f"{identity} ظهرت {len(rows)} مرة، أول مرة {first} وآخر مرة {last}."
-    if kind == "with":
-        return f"{identity} ظهرت {len(rows)} مرة. الناس اللي كانت معاها: {who_txt}. الأفعال: {act_txt}."
-    if kind == "what":
-        return f"اللي قدام الكاميرا: {act_txt}. {who_txt}."
-    return f"لقيت {len(rows)} حدث مسجل، من {first} لحد {last}. الناس: {who_txt}. الأفعال: {act_txt}."
-
-
-def _format_video_answer(question: str, rows, identity, lang: str, window) -> dict:
-    """Shared response builder for the video-offset path, in the asker's language."""
-    is_ar = lang == "ar"
-    if not rows:
-        msg_ar = f"ملقتش أحداث مسجلة لـ {identity} في الفترة دي." if identity else \
-                 "ملقتش أحداث مسجلة في الفترة دي."
-        msg_en = (
-            f"I have no recorded events for {identity} in that time range."
-            if identity else "I have no recorded events in that time range."
-        )
-        return {
-            "answer": msg_ar if is_ar else msg_en,
-            "evidence": [],
-            "query": {"color": _parse_color(question), "mode": "video", "identity": identity, "language": lang},
-            "window": {"start_hms": format_ts(window[0]), "end_hms": format_ts(window[1])},
-            "total_events": 0,
-        }
-
-    # Decide what the question was actually asking.
-    q = normalise_arabic(question)
-    has_video_word = any(w in q for w in ("فيديو", "فديو", "كليب", "video", "clip"))
-    has_with = any(w in q for w in ("مع", "with"))
-    has_when = any(w in q for w in ("امتي", "امتى", "إمتى", "when"))
-    has_what = any(w in q for w in ("ايه", "إيه", "ايلي", "what", "بتعمل", "يعمل"))
-    has_who = any(w in q for w in ("مين", "من", "who"))
-
-    if has_video_word:
-        kind = "clips"
-    elif has_with:
-        kind = "with"
-    elif has_when:
-        kind = "when"
-    elif has_what:
-        kind = "what"
-    elif has_who:
-        kind = "who"
-    else:
-        kind = "all"
-
-    evidence_items = []
-    for r in rows[:200]:
-        try:
-            payload = r[11] if isinstance(r[11], dict) else (json.loads(r[11]) if r[11] else {})
-        except Exception:
-            payload = {}
-        evidence_items.append({
-            "event_id": str(r[0]), "ts": r[2],
-            "wall_ts": r[3],
-            "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r[3] or time.time())),
-            "timestamp_hms": format_ts(r[2]),
-            "event_type": r[4], "identity": r[6], "identity_score": r[7],
-            "shirt_color": r[5], "action": r[8], "action_score": r[9], "vlm": r[10],
-            "image": payload.get("path") or payload.get("frame_path"),
-            "clip": r[12], "rules": payload.get("rules", []),
-        })
-
-    if is_ar:
-        answer_text = _arabic_answer_text(rows, identity or "الشخص ده", window, kind)
-    else:
-        names = sorted({str(r[6]) for r in rows if r[6]})
-        who = ", ".join(names) if names else "no identified person"
-        acts = [r[8] for r in rows if r[8]]
-        acts_txt = ", ".join(sorted(set(acts))[:5]) if acts else "no action label"
-        first = time.strftime("%H:%M:%S", time.localtime(min(r[3] or 0 for r in rows)))
-        last = time.strftime("%H:%M:%S", time.localtime(max(r[3] or 0 for r in rows)))
-        answer_text = (
-            f"I found {len(rows)} recorded events between {first} and {last}. "
-            f"People: {who}. Actions: {acts_txt}."
-        )
-
-    return {
-        "answer": answer_text,
-        "query": {"color": _parse_color(question), "mode": "video", "identity": identity, "language": lang},
-        "window": {"start_hms": format_ts(window[0]), "end_hms": format_ts(window[1])},
-        "total_events": len(rows),
-        "evidence": evidence_items,
-    }
-
-
 def _parse_wall_range(question: str, now: float | None = None) -> tuple[float, float] | None:
     """Detect a real-world time window ('today', 'yesterday', 'last 2 hours', 'on 2026-09-27').
 
@@ -1075,34 +858,28 @@ def _parse_wall_range(question: str, now: float | None = None) -> tuple[float, f
     """
     q = question.lower()
     now = now if now is not None else time.time()
-    local = time.localtime(now)
-    midnight = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+    midnight = now - (now % 86400)
 
-    if "yesterday" in q or "امبارح" in q or "البارحه" in q:
-        prev = time.localtime(midnight - 12 * 3600)
-        prev_midnight = time.mktime((prev.tm_year, prev.tm_mon, prev.tm_mday, 0, 0, 0, 0, 0, -1))
-        return prev_midnight, midnight
-    if any(w in q for w in ("today", "just now", "right now", "النهارده", "النهاردة", "اليوم", "امتى", "إمتى", "اخر حد", "آخر حد", "فيديو", "بتعمل ايه", "بتعمل إيه", "ايه", "إيه", "ظهر النهارده", "ظهرت النهارده")):
-        next_day = time.localtime(midnight + 36 * 3600)
-        tomorrow = time.mktime((next_day.tm_year, next_day.tm_mon, next_day.tm_mday, 0, 0, 0, 0, 0, -1))
-        return midnight, tomorrow
-    if "this week" in q or "الأسبوع" in q or "الاسبوع" in q:
-        return midnight - 6 * 86400, time.mktime((time.localtime(midnight + 36 * 3600).tm_year, time.localtime(midnight + 36 * 3600).tm_mon, time.localtime(midnight + 36 * 3600).tm_mday, 0, 0, 0, 0, 0, -1))
+    if "yesterday" in q:
+        return midnight - 86400, midnight
+    if "today" in q or "just now" in q or "right now" in q:
+        return midnight, now + 60
+    if "this week" in q:
+        return midnight - 6 * 86400, now + 60
 
     m = re.search(r"(?:in the )?last (\d+)\s*(minute|min|hour|hr|day)s?", q)
     if m:
         n = int(m.group(1))
         unit = m.group(2)
         delta = n * 60 if unit.startswith("min") else n * 3600 if unit.startswith("h") else n * 86400
-        return now - delta, now
+        return now - delta, now + 60
 
     m = re.search(r"\bon (\d{4}-\d{2}-\d{2})\b", q)
     if m:
         try:
             y, mo, d = (int(x) for x in m.group(1).split("-"))
             base = time.mktime((y, mo, d, 0, 0, 0, 0, 0, -1))
-            nxt = time.localtime(base + 36 * 3600)
-            return base, time.mktime((nxt.tm_year, nxt.tm_mon, nxt.tm_mday, 0, 0, 0, 0, 0, -1))
+            return base, base + 86400
         except Exception:
             return None
     return None
@@ -1116,39 +893,7 @@ def _parse_color(question: str):
 
 
 def answer(question: str, db_path: str) -> dict:
-    lang = detect_language(question)
-    q_norm = normalise_arabic(question)
-    from services import PostgresEvents
-    # Production always reads the configured system of record (PostgreSQL). An explicit
-    # alternate path is used by local/offline analysis and tests, so honor that path
-    # instead of silently querying unrelated PostgreSQL data.
-    configured_db = Path(config.event_db()).resolve()
-    requested_db = Path(db_path).resolve()
-    store = PostgresEvents() if requested_db == configured_db else EventStore(str(requested_db))
-
-    # Arabic time expressions ("بين 2 و 3", "الساعة ٥") become the same windows the
-    # English path already understands.
-    arabic_window = _parse_time_range_arabic(q_norm) if lang == "ar" else None
-
-    known = _known_identities(store)
-    wanted = extract_identities(q_norm, known)
-    identity = wanted[0] if wanted else None
-
     color = _parse_color(question)
-
-    if arabic_window is not None:
-        if arabic_window[1] > 1e8:
-            return _answer_wall(q_norm, db_path, arabic_window[0], arabic_window[1], color)
-        rows = store.search(color=color, start=arabic_window[0], end=arabic_window[1], identity=identity)
-        return _format_video_answer(q_norm, rows, identity, lang, arabic_window)
-
-    if lang == "ar" and identity is None:
-        # A broad "who appeared today" style question with no name: use the real window.
-        wall = _parse_wall_range(q_norm)
-        if wall is not None:
-            return _answer_wall(q_norm, db_path, wall[0], wall[1], color)
-
-    start, end = _parse_time_range(question)
 
     # A real-world window ("yesterday", "today", "last 2 hours") takes precedence over a
     # video offset, because those questions are about when the recording happened, not
@@ -1160,8 +905,9 @@ def answer(question: str, db_path: str) -> dict:
     start, end = _parse_time_range(question)
 
     identity_match = re.search(r"\bwho\s+is\s+([a-z0-9_\- ]{2,40})\?", question, re.I)
-    if identity is None and identity_match:
-        identity = identity_match.group(1).strip().lower()
+    identity = identity_match.group(1).strip().lower() if identity_match else None
+
+    store = EventStore(db_path)
     rows = store.search(color=color, start=start, end=end, identity=identity)
     if not rows:
         return {
@@ -1187,7 +933,7 @@ def answer(question: str, db_path: str) -> dict:
         event_id, track_id, ts, wall_ts, event_type, shirt_color, ident, ident_score, action, action_score, vlm_text, evidence_json, clip, video = row
         summary.append(f"{event_type} at {format_ts(ts)}")
         try:
-            payload = evidence_json if isinstance(evidence_json, dict) else (json.loads(evidence_json) if evidence_json else {})
+            payload = json.loads(evidence_json) if evidence_json else {}
         except Exception:
             payload = {}
         evidence_items.append(
@@ -1238,21 +984,15 @@ def answer(question: str, db_path: str) -> dict:
 
 def _answer_wall(question: str, db_path: str, start_wall: float, end_wall: float, color) -> dict:
     """Answer a question about when something happened, not where in a clip."""
-    from services import PostgresEvents
-    store = PostgresEvents()
-    names = extract_identities(normalise_arabic(question), _known_identities(store))
-    requested_identity = names[0] if names else None
-    rows = store.search_wall(start_wall, end_wall, color=color, identity=requested_identity)
+    store = EventStore(db_path)
+    rows = store.search_wall(start_wall, end_wall, color=color)
     label = time.strftime("%Y-%m-%d %H:%M", time.localtime(start_wall))
     span = time.strftime("%Y-%m-%d %H:%M", time.localtime(end_wall))
     window = {"start": start_wall, "end": end_wall, "start_label": label, "end_label": span}
 
     if not rows:
-        ar = detect_language(question) == "ar"
         return {
             "answer": (
-                (f"ملقتش أحداث مسجلة لمنة النهارده ({label} لحد {span})." if "menna" in question.lower() or "منة" in question else f"ملقتش أحداث مسجلة في الفترة دي ({label} لحد {span}).")
-                if ar else
                 f"I have no recordings for {label} to {span}. "
                 "Start a Live Camera session and I will remember what happens."
             ),
@@ -1262,7 +1002,6 @@ def _answer_wall(question: str, db_path: str, start_wall: float, end_wall: float
             "total_events": 0,
         }
 
-    # Collapse Arabic/Latin name spellings to the canonical enrolled identity.
     people: dict[str, int] = {}
     actions: dict[str, int] = {}
     evidence_items = []
@@ -1274,7 +1013,7 @@ def _answer_wall(question: str, db_path: str, start_wall: float, end_wall: float
         if r[8]:
             actions[r[8]] = actions.get(r[8], 0) + 1
         try:
-            payload = r[11] if isinstance(r[11], dict) else (json.loads(r[11]) if r[11] else {})
+            payload = json.loads(r[11]) if r[11] else {}
         except Exception:
             payload = {}
         evidence_items.append(
@@ -1291,9 +1030,6 @@ def _answer_wall(question: str, db_path: str, start_wall: float, end_wall: float
                 "action": r[8],
                 "action_score": r[9],
                 "vlm": r[10],
-                "nearby_objects": payload.get("nearby_objects", []),
-                "objects": payload.get("objects", []),
-                "track_id": r[1],
                 "image": payload.get("path"),
                 "clip": r[12],
                 "rules": payload.get("rules", []),
@@ -1305,42 +1041,11 @@ def _answer_wall(question: str, db_path: str, start_wall: float, end_wall: float
     first = time.strftime("%H:%M:%S", time.localtime(rows[0][3] or time.time()))
     last = time.strftime("%H:%M:%S", time.localtime(rows[-1][3] or time.time()))
 
-    ar = detect_language(question) == "ar"
-    if ar:
-        ar_who = " و".join(f"{k} ({v} مرات)" for k, v in sorted(people.items(), key=lambda kv: -kv[1])) \
-            or "مفيش حد متسجل"
-        ar_did = "، ".join(sorted(actions, key=lambda a: -actions[a])[:5]) or "مفيش إجراء محدد"
-        answer_text = (
-            f"النهارده من {label} لحد {span} سجّلت {len(rows)} مشاهدة "
-            f"({first} لحد {last}). الناس اللي ظهرت: {ar_who}. الأفعال: {ar_did}."
-        )
-        q = normalise_arabic(question)
-        if "اخر حد" in q or "آخر حد" in q:
-            latest = max(rows, key=lambda r: float(r[3] or 0))
-            name = latest[6] or "شخص غير معروف"
-            at = time.strftime("%H:%M:%S", time.localtime(latest[3] or time.time()))
-            answer_text = f"آخر حد ظهر هو {name} الساعة {at}."
-            evidence_items = [item for item in evidence_items if str(item["event_id"]) == str(latest[0])]
-        if "فيديو" in q:
-            has_clip = any(bool(r[12]) for r in rows)
-            answer_text = (f"أيوه، فيه فيديو محفوظ لمنة النهارده ({len(rows)} حدث)." if has_clip else f"ملقتش فيديو محفوظ لمنة النهارده؛ لقيت {len(rows)} حدث مسجل." )
-        if "بتعمل ايه" in q or "بتعمل إيه" in q or "ايه" in q or "إيه" in q:
-            observed_actions = sorted({str(r[8]) for r in rows if r[8]})
-            colors = sorted({str(r[5]) for r in rows if r[5]})
-            objects = sorted({str(o) for r in rows for o in ((r[11] or {}).get("nearby_objects", []) if isinstance(r[11], dict) else [])})
-            parts = []
-            if observed_actions: parts.append("الحركة المرصودة: " + "، ".join(observed_actions))
-            if colors: parts.append("لون الملابس المقدر: " + "، ".join(colors))
-            if objects: parts.append("أشياء قريبة في الصورة: " + "، ".join(objects))
-            answer_text = ("؛ ".join(parts) + ".") if parts else "فيه ظهور مسجل، لكن مفيش وصف حركة أو ملابس أو أشياء محفوظ أقدر أأكد منه."
-    else:
-        answer_text = (
-            f"Between {label} and {span} I recorded {len(rows)} events ({first} to {last}). "
-            f"People seen: {who}. Actions detected: {did}."
-        )
-
     return {
-        "answer": answer_text,
+        "answer": (
+            f"Between {label} and {span} I recorded {len(rows)} events ({first} → {last}). "
+            f"People seen: {who}. Actions detected: {did}."
+        ),
         "evidence": evidence_items[:200],
         "query": {"color": color, "mode": "wall_clock", "window": window},
         "window": window,

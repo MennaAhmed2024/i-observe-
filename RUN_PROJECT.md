@@ -38,11 +38,12 @@ from the process environment only:
 
 ## 4. Start required infrastructure
 
-PostgreSQL + Qdrant (Docker):
+PostgreSQL + Redis (Docker). Qdrant is not a compose service: the face index runs embedded
+via `QDRANT_PATH`, so `docker compose up -d postgres qdrant` fails with "no such service".
 
 ```powershell
 cd E:\I-observe
-docker compose up -d postgres qdrant
+docker compose up -d postgres redis
 docker ps --filter "name=iobserve"
 ```
 
@@ -221,7 +222,7 @@ stack alone — this project never modifies them.
 ```powershell
 cd E:\I-observe
 .\.venv\Scripts\Activate.ps1
-docker compose up -d postgres qdrant
+docker compose up -d postgres redis
 Start-Process -FilePath '.\.venv\Scripts\python.exe' -ArgumentList '-m','moto.server','-p','9000' -WindowStyle Hidden
 Start-Sleep -Seconds 8
 docker ps --filter "name=iobserve"
@@ -235,7 +236,7 @@ Remove-Item -ErrorAction SilentlyContinue events.sqlite
 ```powershell
 cd E:\I-observe
 .\.venv\Scripts\Activate.ps1
-docker compose up -d postgres qdrant
+docker compose up -d postgres redis
 Start-Process -FilePath '.\.venv\Scripts\python.exe' -ArgumentList '-m','moto.server','-p','9000' -WindowStyle Hidden
 Start-Sleep -Seconds 8
 .\.venv\Scripts\python.exe enroll_people.py menna data\people\menna\*.jpeg

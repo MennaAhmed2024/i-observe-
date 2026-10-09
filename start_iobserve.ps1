@@ -54,7 +54,9 @@ docker compose up -d postgres redis 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Die "docker compose failed to start PostgreSQL/Redis." }Ok "PostgreSQL and Redis requested (MinIO is optional and excluded)"
 
 # ---- 4. wait for postgres ----
-$pgPort = 5433
+# 15432 is the host port docker-compose.yml maps; 5433 is reserved by Windows (see the
+# note in docker-compose.yml) and reported a healthy database on the wrong port.
+$pgPort = 15432
 $pgReady = $false
 for ($i = 0; $i -lt 30; $i++) {
   $s = docker ps --filter "name=iobserve-postgres" --format '{{.Status}}' 2>$null
@@ -100,6 +102,45 @@ if (-not $up) {
   Die "The web console did not become healthy. Check tools\server.err"
 }
 Ok "web console is healthy"
+
+# ---- 9. the assistant chat app (assistant-ui / Next.js), embedded in the dashboard ----
+# Optional: the dashboard works without it and shows an ASSISTANT button that reports
+# "NOT RUNNING" with a retry, so a failure here must never abort the launch.
+$assistantPort = 3100
+$webDir = Join-Path $root 'web'
+if (Test-Path (Join-Path $webDir 'node_modules')) {
+  $busyWeb = Get-NetTCPConnection -LocalPort $assistantPort -State Listen -ErrorAction SilentlyContinue
+  if ($busyWeb) {
+    Info "assistant already listening on $assistantPort; reusing it"
+  } else {
+    # `Get-Command npm` resolves to npm.ps1 on this machine, and Start-Process cannot
+    # execute a .ps1 that way: it spawns an idle cmd.exe, web.log stays empty, and the
+    # dashboard assistant silently reports NOT RUNNING. The .cmd shim is the executable.
+    $npm = (Get-Command npm.cmd -ErrorAction SilentlyContinue)
+    if (-not $npm) {
+      Warn "npm not found on PATH - the dashboard assistant will report NOT RUNNING"
+    } else {
+      $built = Test-Path (Join-Path $webDir '.next\BUILD_ID')
+      $script = if ($built) { 'start' } else { 'dev' }
+      Info "starting the dashboard assistant on $assistantPort (npm run $script)"
+      Start-Process -FilePath $npm.Source -ArgumentList 'run', $script `
+        -WindowStyle Hidden -WorkingDirectory $webDir `
+        -RedirectStandardOutput (Join-Path $root 'tools\web.log') `
+        -RedirectStandardError (Join-Path $root 'tools\web.err')
+      $webUp = $false
+      for ($i = 0; $i -lt 40; $i++) {
+        try {
+          if ((Invoke-WebRequest -Uri "http://localhost:$assistantPort" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $webUp = $true; break }
+        } catch {}
+        Start-Sleep -Seconds 1
+      }
+      if ($webUp) { Ok "assistant is up at http://localhost:$assistantPort" }
+      else { Warn "assistant did not answer on $assistantPort yet - check tools\web.err; the dashboard will show NOT RUNNING" }
+    }
+  }
+} else {
+  Warn "web\node_modules missing - run 'npm install' in .\web to enable the dashboard assistant"
+}
 
 Write-Host ""
 Write-Host "  ============================================================" -ForegroundColor Green

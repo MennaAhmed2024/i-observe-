@@ -5,20 +5,22 @@ from concurrent.futures import ThreadPoolExecutor
 import glob
 import json
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query as QueryParam, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query as QueryParam, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, generate_latest
 from pydantic import BaseModel
 
 from pipeline_v2 import EventStore, answer, format_ts
 from services import PostgresEvents, RedisCache
+import auth
 from vision_core import (
     MiniFASNet,
     OnnxEmbedder512,
@@ -36,6 +38,9 @@ _face_stack = None
 _face_stack_lock = threading.Lock()
 _scene_lock = threading.Lock()
 _scene_analyzer = None
+_object_lock = threading.Lock()
+_object_detector = None
+_object_error = None
 _redis_cache = None
 _redis_lock = threading.Lock()
 _face_inference_lock = threading.Lock()
@@ -43,6 +48,16 @@ _record_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-re
 _record_future = None
 _record_result = {}
 _record_error = None
+_record_last_submitted = 0.0
+_object_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-objects")
+_object_future = None
+_object_result = []
+_object_last_submitted = 0.0
+_vlm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-vlm")
+_vlm_future = None
+_vlm_result = {"text": None, "error": None, "updated_at": None, "elapsed_s": None}
+_vlm_last_submitted = 0.0
+_live_ai_lock = threading.Lock()
 
 ROOT = Path(__file__).resolve().parent
 UI_DIR = ROOT / "ui"
@@ -68,7 +83,9 @@ def face_stack():
                 if embedder.dim != 512:
                     raise RuntimeError(f"Active ArcFace model must output 512-D, got {embedder.dim}")
                 _face_stack = (
-                    YOLO11FaceDetector(str(config.YOLO_FACE_MODEL)),
+                    YOLO11FaceDetector(
+                        str(config.YOLO_FACE_MODEL), image_size=config.YOLO_FACE_IMAGE_SIZE
+                    ),
                     embedder,
                     MiniFASNet(str(config.LIVENESS_PATH)),
                     TurboVecFaceIndex(path=config.TURBOVEC_PATH, dim=embedder.dim),
@@ -77,10 +94,23 @@ def face_stack():
 
 
 def _check_auth(authorization: str | None) -> None:
+    """API-token auth (legacy) plus user JWT sessions from login/register.
+
+    A valid user JWT in the Bearer header always passes. Otherwise the legacy
+    API_TOKEN rule applies when set. When no API_TOKEN is configured but at
+    least one user account exists, a login is required instead of leaving
+    the API open. Fresh installs with no users stay open for first registration.
+    """
+    token = (authorization or "")
+    if token.startswith("Bearer "):
+        token = token[len("Bearer "):].strip()
+    if token and auth.read_token(token):
+        return
     expected = os.getenv("API_TOKEN")
     if expected and authorization != f"Bearer {expected}":
         raise HTTPException(401, "Invalid bearer token")
-
+    if not expected and auth.user_count() > 0:
+        raise HTTPException(401, "Login required")
 
 
 @app.on_event("startup")
@@ -116,7 +146,7 @@ class LiveSceneAnalyzer:
 
     def analyze(self, frame, faces):
         result = self.model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False,
-                                  conf=0.25, imgsz=320, classes=[0, 24, 26, 28])[0]
+                                  conf=0.25, imgsz=256, classes=[0, 24, 26, 28])[0]
         people, objects = [], []
         for box in result.boxes or []:
             cls_id = int(box.cls[0].item())
@@ -155,6 +185,144 @@ def live_scene(frame, faces):
         return _scene_analyzer.analyze(frame, faces)
 
 
+class ObjectDetector:
+    """YOLOv8n COCO object detection - runs NEXT to the YOLO11 face stack, never instead of it.
+
+    Faces keep their own model (yolo11n-pose_widerface), this one reports the COCO classes
+    the face path does not cover, so a room with no recognisable face still shows live
+    output from the second model.
+    """
+
+    def __init__(self):
+        from ultralytics import YOLO
+        import config as _config
+        candidates = [
+            _config.YOLO_OBJECT_MODEL,
+            _config.MODEL_DIR / "yolov8n.pt",
+            _config.ROOT / "yolov8n.pt",
+        ]
+        path = next((p for p in candidates if p.exists()), None)
+        self.model = YOLO(str(path)) if path else YOLO("yolov8n.pt")  # ultralytics downloads on first miss
+        self.conf = _config.YOLO_OBJECT_CONF
+
+    def detect(self, frame):
+        result = self.model.predict(
+            frame, conf=self.conf, imgsz=config.YOLO_OBJECT_IMAGE_SIZE, verbose=False, max_det=50
+        )[0]
+        found = []
+        for box in result.boxes or []:
+            cls_id = int(box.cls[0].item())
+            name = str(result.names.get(cls_id, cls_id))
+            # `person` is dropped on purpose: YOLO11 already reports people (face + person
+            # box), so a second COCO person box on top of it is pure visual noise.
+            if name == "person":
+                continue
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            found.append({"label": name, "bbox": [x1, y1, x2, y2],
+                          "score": round(float(box.conf[0].item()), 3)})
+        return found
+
+
+def detect_objects(frame):
+    """Thread-safe lazy singleton. Returns [] when disabled or when the model fails to load,
+    so an object-detection problem never takes the face pipeline down."""
+    global _object_detector, _object_error
+    if not config.YOLO_OBJECT_ENABLED:
+        return []
+    with _object_lock:
+        try:
+            if _object_detector is None:
+                _object_detector = ObjectDetector()
+            return _object_detector.detect(frame)
+        except Exception as exc:
+            _object_error = f"{type(exc).__name__}: {exc}"
+            _object_detector = None
+            return []
+
+
+def latest_objects(frame, faces):
+    """Return objects already produced by the background YOLO11 scene tracker.
+
+    The live recorder runs person/object tracking. Starting a second YOLOv8 inference
+    here caused CPU contention and doubled face latency, so the camera reuses that real
+    tracker snapshot instead of running duplicate inference.
+    """
+    with _live_ai_lock:
+        current = list((_record_result.get("scene") or {}).get("objects", []))
+    return drop_face_artifacts(current, faces)
+
+
+def _describe_live_frame(frame):
+    """Run one real VLM request from an isolated temporary snapshot."""
+    from ai_models import make_vlm
+
+    folder = ROOT / "data" / "live_vlm"
+    folder.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    started = time.perf_counter()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", dir=folder, delete=False) as temp:
+            temp_path = Path(temp.name)
+        if not cv2.imwrite(str(temp_path), frame):
+            raise RuntimeError("Could not encode VLM camera snapshot")
+        text = make_vlm().describe(
+            [str(temp_path)],
+            "Describe only what is visibly happening in this live camera frame in one concise "
+            "sentence. Mention people, actions, clothing and nearby objects. Do not guess identity.",
+        )
+        return {"text": str(text).strip(), "error": None,
+                "updated_at": time.time(), "elapsed_s": round(time.perf_counter() - started, 2)}
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def latest_live_vlm(frame):
+    """Maintain a periodic VLM caption; never wait for it on the camera request path."""
+    global _vlm_future, _vlm_result, _vlm_last_submitted
+    now = time.monotonic()
+    with _live_ai_lock:
+        if _vlm_future is not None and _vlm_future.done():
+            try:
+                _vlm_result = _vlm_future.result()
+            except Exception as exc:
+                _vlm_result = {"text": _vlm_result.get("text"),
+                               "error": f"{type(exc).__name__}: {exc}",
+                               "updated_at": _vlm_result.get("updated_at"), "elapsed_s": None}
+            _vlm_future = None
+        if _vlm_future is None and now - _vlm_last_submitted >= config.LIVE_VLM_INTERVAL_S:
+            _vlm_last_submitted = now
+            _vlm_future = _vlm_executor.submit(_describe_live_frame, frame.copy())
+        result = dict(_vlm_result)
+        result["running"] = _vlm_future is not None
+    return result
+
+
+def drop_face_artifacts(objects, faces, containment=0.6):
+    """Remove COCO boxes that sit almost entirely inside a detected face box.
+
+    A second model labelling the face itself (a scarf scored as `tie`, glasses scored as
+    `sunglasses`) is a detector artefact, not a thing in the room, and it paints a second
+    box over the face the user is trying to read. Anything that overlaps a face less than
+    `containment` of its own area is a real object and is kept.
+    """
+    if not objects or not faces:
+        return objects
+    kept = []
+    for o in objects:
+        ox1, oy1, ox2, oy2 = o["bbox"]
+        area = max(1, (ox2 - ox1) * (oy2 - oy1))
+        inside = 0
+        for f in faces:
+            fx1, fy1, fx2, fy2 = f["bbox"]
+            ix = max(0, min(ox2, fx2) - max(ox1, fx1))
+            iy = max(0, min(oy2, fy2) - max(oy1, fy1))
+            inside = max(inside, ix * iy)
+        if inside / area < containment:
+            kept.append(o)
+    return kept
+
+
 def associate_face_tracks(faces, tracks):
     """Attach the persistent person track id to each face inside that person box."""
     for face in faces:
@@ -188,12 +356,92 @@ class AnalyzeRequest(BaseModel):
 
 
 @app.get("/", include_in_schema=False)
-def home():
-    """The I-observe dashboard. Served from the same FastAPI app, so there is one port."""
+def home(request: Request, authorization: str | None = Header(default=None)):
+    """The I-observe dashboard. Requires login once any user account exists."""
+    if not _browser_is_authed(request, authorization):
+        return RedirectResponse(url="/login", status_code=302)
     index = UI_DIR / "dashboard.html"
     if not index.exists():
         raise HTTPException(500, f"UI asset missing: {index}")
     return FileResponse(str(index), media_type="text/html")
+
+
+def _browser_is_authed(request: Request, authorization: str | None) -> bool:
+    """Same rules as _check_auth, but True/False for page redirects."""
+    if auth.read_token(request.cookies.get(auth.COOKIE_NAME)):
+        return True
+    token = (authorization or "")
+    if token.startswith("Bearer "):
+        token = token[len("Bearer "):].strip()
+    if token and auth.read_token(token):
+        return True
+    expected = os.getenv("API_TOKEN")
+    if expected:
+        return authorization == f"Bearer {expected}"
+    return auth.user_count() == 0
+
+
+@app.get("/login", include_in_schema=False)
+def login_page():
+    """Login / register screen. Served without auth so users can sign in."""
+    page = UI_DIR / "login.html"
+    if not page.exists():
+        raise HTTPException(500, f"UI asset missing: {page}")
+    return FileResponse(str(page), media_type="text/html")
+
+
+class AuthBody(BaseModel):
+    username: str
+    password: str
+
+
+def _issue_session(response: Response, username: str) -> str:
+    token = auth.make_token(username)
+    response.set_cookie(
+        auth.COOKIE_NAME, token,
+        httponly=True, samesite="lax", path="/", max_age=auth.TOKEN_TTL_S,
+    )
+    return token
+
+
+@app.post("/api/auth/register")
+def api_register(body: AuthBody, response: Response):
+    """Create the operator account and sign in immediately."""
+    try:
+        username = auth.create_user(body.username, body.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    token = _issue_session(response, username)
+    return {"ok": True, "username": username, "token": token}
+
+
+@app.post("/api/auth/login")
+def api_login(body: AuthBody, response: Response):
+    """Verify credentials and start a browser session."""
+    username = auth.verify_user(body.username, body.password)
+    if not username:
+        raise HTTPException(401, "Wrong username or password")
+    token = _issue_session(response, username)
+    return {"ok": True, "username": username, "token": token}
+
+
+@app.post("/api/auth/logout")
+def api_logout(response: Response):
+    """End the browser session."""
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def api_me(request: Request, authorization: str | None = Header(default=None)):
+    """Who is signed in (cookie or Bearer JWT)."""
+    user = auth.read_token(request.cookies.get(auth.COOKIE_NAME))
+    if not user and authorization:
+        token = authorization[len("Bearer "):].strip() if authorization.startswith("Bearer ") else authorization
+        user = auth.read_token(token)
+    if not user:
+        raise HTTPException(401, "Login required")
+    return {"username": user}
 
 
 def _safe_media_dir(*parts: str) -> Path:
@@ -204,7 +452,7 @@ def _safe_media_dir(*parts: str) -> Path:
     return base
 
 
-for _name, _sub in (("evidence", "evidence"), ("clips", "clips"), ("outputs", "outputs")):
+for _name, _sub in (("evidence", "evidence"), ("clips", "clips"), ("outputs", "outputs"), ("docs", "docs")):
     _d = ROOT / _sub
     _d.mkdir(parents=True, exist_ok=True)
     app.mount(f"/{_name}", StaticFiles(directory=str(_d)), name=_name)
@@ -388,7 +636,6 @@ async def api_live_observe(
     return await asyncio.to_thread(record_live_frame, frame, session)
 
 
-
 def record_live_frame(frame, session=None, analysis=None):
     recorded_now = []
     try:
@@ -479,17 +726,10 @@ def record_live_frame(frame, session=None, analysis=None):
             cv2.circle(crop_vis, (int(lx), int(ly)), 1, color, -1)
         cv2.imwrite(str(shot), crop_vis)
 
-        # Throttled: a network round trip per face per frame would kill the frame rate.
-        vlm_text = None
-        if is_live and LIVE["events"] % 5 == 0:
-            try:
-                from ai_models import make_vlm
-
-                vlm_text = make_vlm().describe(
-                    [str(shot)], "In one short sentence, what is this person doing and wearing?"
-                )
-            except Exception:
-                vlm_text = None
+        # Reuse the continuously refreshed camera caption. Persistence never performs
+        # a remote VLM call and therefore cannot stall live face detection.
+        with _live_ai_lock:
+            vlm_text = _vlm_result.get("text")
 
         ev_payload = {
             "source": "live-camera",
@@ -600,7 +840,6 @@ def analyse_faces(frame):
         return _analyse_faces(frame)
 
 
-
 def _analyse_faces(frame):
     """Run the full face stack on EVERY face YuNet found in one frame.
 
@@ -706,10 +945,14 @@ async def api_camera_detect(
     if frame is None:
         raise HTTPException(422, "Image could not be decoded")
     started = time.perf_counter()
+    # Face recognition is the latency-critical path. Object detection and the remote
+    # VLM refresh independently; this request never waits for either one.
     results, face_count, frame_size = await asyncio.to_thread(analyse_faces, frame)
+    objects = latest_objects(frame, results)
+    vlm = latest_live_vlm(frame)
     # One background observation at a time: no stale-frame queue, duplicate face
     # inference, or database/VLM latency on the camera's response path.
-    global _record_future, _record_result, _record_error
+    global _record_future, _record_result, _record_error, _record_last_submitted
     if _record_future is not None and _record_future.done():
         try:
             _record_result = _record_future.result()
@@ -717,13 +960,19 @@ async def api_camera_detect(
         except Exception as exc:
             _record_error = f"{type(exc).__name__}: {exc}"
         _record_future = None
-    if LIVE["recording"] and _record_future is None:
+    record_now = time.monotonic()
+    if (LIVE["recording"] and _record_future is None
+            and record_now - _record_last_submitted >= config.LIVE_RECORD_INTERVAL_S):
         import copy
+        _record_last_submitted = record_now
         _record_future = _record_executor.submit(
             record_live_frame, frame.copy(), LIVE.get("session"),
             (copy.deepcopy(results), face_count, frame_size),
         )
     payload = {"detections": results, "face_count": face_count, "frame_size": list(frame_size),
+               "objects": objects, "object_error": _object_error,
+               "object_model": "yolov8n" if config.YOLO_OBJECT_ENABLED else None,
+               "vlm": vlm,
                "inference_ms": round((time.perf_counter()-started)*1000, 1),
                "events_recorded": LIVE["events"], "session": LIVE.get("session"),
                "last": _record_result.get("last"),
@@ -750,6 +999,13 @@ async def api_camera_detect(
         for lx, ly in r.get("landmarks", []):
             cv2.circle(frame, (int(lx), int(ly)), 1, color, -1)
 
+    # YOLOv8n objects: cyan boxes, kept visually distinct from the face boxes above.
+    for o in objects:
+        x1, y1, x2, y2 = o["bbox"]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+        cv2.putText(frame, f"{o['label']} {o['score']*100:.0f}%", (x1, max(20, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
     if not ok:
         raise HTTPException(500, "failed to encode annotated frame")
@@ -769,6 +1025,7 @@ def system_status():
         "face_index": {"ok": False, "detail": "not checked"},
         "storage": {"ok": False, "detail": "not checked"},
         "face": {"ok": False, "detail": "not checked"},
+        "objects": {"ok": False, "detail": "not checked"},
         "liveness": {"ok": False, "detail": "Not validated on representative live/spoof data"},
         "videomae": {"ok": False, "detail": "not loaded"},
         "vlm": {"ok": False, "detail": "not configured"},
@@ -838,6 +1095,19 @@ def system_status():
         }
     except Exception as exc:
         out["face"] = {"ok": False, "detail": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+    # YOLOv8n object detector (status only - never load the model from a health check)
+    try:
+        if not config.YOLO_OBJECT_ENABLED:
+            out["objects"] = {"ok": True, "detail": "disabled by YOLO_OBJECT_ENABLED=0"}
+        else:
+            hits = [p for p in (config.YOLO_OBJECT_MODEL, ROOT / "models" / "yolov8n.pt", ROOT / "yolov8n.pt")
+                    if p.exists()]
+            where = str(hits[0]) if hits else "yolov8n.pt (auto-download on first frame)"
+            out["objects"] = {"ok": True, "detail": f"YOLOv8n COCO · {where}" +
+                              (f" · last error: {_object_error}" if _object_error else "")}
+    except Exception as exc:
+        out["objects"] = {"ok": False, "detail": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
     # VideoMAE checkpoint presence
     try:
@@ -1065,69 +1335,63 @@ def api_evidence(authorization: str | None = Header(default=None)):
 # Background video analysis
 # --------------------------------------------------------------------------------------
 
-JOB = {"running": False, "report": None, "error": None, "started": None, "finished": None}
+JOB = {"running": False, "report": None, "error": None, "started": None, "finished": None,
+       "stage": None}
 
 
 def _run_analysis(source: str, use_videomae: bool, use_vlm: bool):
-    import pipeline_v2
-
     try:
-        # Annotate an output video so the UI can play the result back.
+        import analyze_face_video
+
         out_dir = ROOT / "outputs"
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = Path(source).stem or "clip"
         annotated = out_dir / f"{stem}_annotated.mp4"
-
-        if use_videomae:
-            report, _store, records = pipeline_v2.process(
-                source,
-                event_db_path(),
-                evidence_dir=str(ROOT / "evidence"),
-                clip_dir=str(ROOT / "clips"),
-                use_videomae=True,
-                use_vlm=use_vlm,
-            )
-        else:
-            report, _store, records = pipeline_v2.process(
-                source,
-                event_db_path(),
-                evidence_dir=str(ROOT / "evidence"),
-                clip_dir=str(ROOT / "clips"),
-                use_videomae=False,
-                use_vlm=False,
-            )
-
-        # Re-run the face pass to produce the annotated video via the existing function.
-        try:
-            import analyze_face_video
-
-            summary = analyze_face_video.run(source, str(annotated), sample_every=6)
-            report["annotated"] = "/outputs/" + annotated.name
-            report["annotated_summary"] = {k: v for k, v in summary.items() if k != "events"}
-            dets = []
-            for ev in summary.get("events", [])[:300]:
-                dets.append(
-                    {
-                        "time": ev.get("time"),
-                        "identity": ev.get("identity"),
-                        "similarity": ev.get("similarity"),
-                        "live": ev.get("live"),
-                        "liveness_score": ev.get("liveness_score"),
-                        "action": next((r.get("event") for r in records if abs(r.get("ts", -1) - ev.get("time", -2)) < 0.2), None),
-                        "evidence_url": None,
-                    }
-                )
-            report["detections"] = dets
-            report["identities"] = summary.get("identities", [])
-            report["identified_faces"] = summary.get("identified_faces", 0)
-        except Exception as exc:
-            report["annotated_error"] = f"{type(exc).__name__}: {exc}"
-
+        JOB["stage"] = "fast detection, tracking and recognition"
+        cap = cv2.VideoCapture(str(source))
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        cap.release()
+        # CPU demo mode: recognise every second and carry the stable track box
+        # between samples. This removes the former duplicate full-video AI pass.
+        summary = analyze_face_video.run(
+            source, str(annotated), sample_every=max(1, int(source_fps)),
+            stack=face_stack(),
+        )
+        dets = [
+            {
+                "time": ev.get("time"), "track_id": ev.get("track_id"),
+                "identity": ev.get("identity"), "similarity": ev.get("similarity"),
+                "live": ev.get("live"), "liveness_score": ev.get("liveness_score"),
+                "bbox": ev.get("bbox"), "action": None, "evidence_url": None,
+            }
+            for ev in summary.get("events", [])[:300]
+        ]
+        report = {
+            "source": str(source), "annotated": "/outputs/" + annotated.name,
+            "annotated_summary": {k: v for k, v in summary.items() if k != "events"},
+            "detections": dets, "identities": summary.get("identities", []),
+            "identified_faces": summary.get("identified_faces", 0),
+            "advanced_requested": bool(use_videomae or use_vlm),
+        }
         JOB["report"] = report
+
+        # Advanced action/VLM enrichment is optional and runs only after the playable
+        # result already exists. The UI can show the result while this stage continues.
+        if use_videomae:
+            import pipeline_v2
+            JOB["stage"] = "optional VideoMAE/VLM enrichment"
+            advanced, _store, _records = pipeline_v2.process(
+                source, event_db_path(), evidence_dir=str(ROOT / "evidence"),
+                clip_dir=str(ROOT / "clips"), use_videomae=True,
+                use_vlm=use_vlm, sample_fps=1,
+            )
+            report["advanced"] = advanced
+            JOB["report"] = report
     except Exception as exc:
         JOB["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         JOB["running"] = False
+        JOB["stage"] = "complete" if JOB.get("report") else "failed"
         JOB["finished"] = time.time()
 
 
@@ -1145,7 +1409,8 @@ def api_analyze(req: AnalyzeRequest, authorization: str | None = Header(default=
             pass
         else:
             raise HTTPException(404, f"video not found: {src}")
-    JOB.update({"running": True, "report": None, "error": None, "started": time.time()})
+    JOB.update({"running": True, "report": None, "error": None, "started": time.time(),
+                "finished": None, "stage": "starting"})
     threading.Thread(target=_run_analysis, args=(src, req.videomae, req.vlm), daemon=True).start()
     return {"started": True, "source": src}
 
@@ -1159,6 +1424,7 @@ def api_analyze_status(authorization: str | None = Header(default=None)):
         "error": JOB.get("error"),
         "started": JOB.get("started"),
         "finished": JOB.get("finished"),
+        "stage": JOB.get("stage"),
     }
 
 
@@ -1186,7 +1452,17 @@ async def api_identify_image(image: UploadFile = File(...), authorization: str |
 def query(q: Query, authorization: str | None = Header(default=None)):
     _check_auth(authorization)
     REQUESTS.inc()
-    result = answer(q.question, event_db_path())
+    try:
+        result = answer(q.question, event_db_path())
+    except Exception as exc:
+        # The timeline is read from the PostgreSQL mirror. When that is unreachable the
+        # caller must see why, and the JSON detail must survive: an unhandled exception
+        # makes Starlette return a plain-text 500, the dashboard's JSON.parse fails, and
+        # the user is told only "HTTP 500" as if their question were at fault.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Event database unavailable: {type(exc).__name__}: {exc}",
+        ) from exc
     for item in result.get("evidence", []):
         item["image_url"] = _evidence_url(item.get("image"))
         clip = item.get("clip")
@@ -1329,7 +1605,7 @@ async def publish_event(
 async def incidents(ws: WebSocket):
     token = ws.query_params.get("token")
     expected = os.getenv("API_TOKEN")
-    if expected and token != expected:
+    if expected and token != expected and not auth.read_token(token):
         await ws.close(code=4401)
         return
     await ws.accept()

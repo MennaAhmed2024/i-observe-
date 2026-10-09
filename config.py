@@ -73,6 +73,16 @@ EVIDENCE_DIR = ROOT / "evidence"
 CLIP_DIR = ROOT / "clips"
 
 YOLO_FACE_MODEL = Path(os.getenv("YOLO_FACE_MODEL", str(MODEL_DIR / "yolo11n-pose_widerface.pt")))
+YOLO_FACE_IMAGE_SIZE = int(os.getenv("YOLO_FACE_IMAGE_SIZE", "480"))
+# Second model: YOLOv8n does general COCO object detection, YOLO11 does faces.
+# Resolved in order: env override -> models/ -> repo root (ultralytics auto-download).
+YOLO_OBJECT_MODEL = Path(os.getenv("YOLO_OBJECT_MODEL", str(MODEL_DIR / "yolov8n.pt")))
+YOLO_OBJECT_ENABLED = os.getenv("YOLO_OBJECT_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+YOLO_OBJECT_CONF = float(os.getenv("YOLO_OBJECT_CONF", "0.35"))
+YOLO_OBJECT_IMAGE_SIZE = int(os.getenv("YOLO_OBJECT_IMAGE_SIZE", "256"))
+LIVE_OBJECT_INTERVAL_S = float(os.getenv("LIVE_OBJECT_INTERVAL_S", "5.0"))
+LIVE_VLM_INTERVAL_S = float(os.getenv("LIVE_VLM_INTERVAL_S", "3.0"))
+LIVE_RECORD_INTERVAL_S = float(os.getenv("LIVE_RECORD_INTERVAL_S", "1.5"))
 LIVENESS_PATH = MODEL_DIR / "minifasnet_v2.onnx"
 TURBOVEC_PATH = Path(os.getenv("TURBOVEC_PATH", str(DATA_DIR / "face_index_512.tvim")))
 ARCFACE_MATCH_THRESHOLD = float(os.getenv("ARCFACE_MATCH_THRESHOLD", "0.25"))
@@ -160,6 +170,7 @@ def describe() -> dict:
         dsn = "(not set)"
     return {
         "detector": str(YOLO_FACE_MODEL),
+        "object_detector": str(YOLO_OBJECT_MODEL) if YOLO_OBJECT_ENABLED else "(disabled)",
         "liveness": str(LIVENESS_PATH),
         "embedder": info["name"],
         "embedder_path": str(info["path"]),

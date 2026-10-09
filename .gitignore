@@ -41,6 +41,7 @@ __pycache__/
 # Temp / lab
 duckdb_lab/
 events.sqlite-journal
+*.part
 
 # Diagnostics
 .docker-state-*.txt

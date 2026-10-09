@@ -9,9 +9,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    # 5433 on the host: 5432 is already used by the machine's own PostgreSQL 18 service.
+    # 5433 was the original host port, but Windows reserves TCP 5433-6032 (Hyper-V/WSL
+    # excluded ranges), so the mapping could never bind and Postgres was unreachable from
+    # the host - every event write timed out. 15432 is outside the reserved ranges.
     ports:
-      - "5433:5432"
+      - "15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
