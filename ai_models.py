@@ -186,8 +186,8 @@ PROVIDERS = {
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "key_env": "OPENROUTER_API_KEY",
-        # Vision-capable and available on OpenRouter.
-        "model": "google/gemini-2.0-flash-001",
+        # Free router automatically selects a free model compatible with image input.
+        "model": "openrouter/free",
         "label": "OpenRouter",
     },
 }

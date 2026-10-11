@@ -40,7 +40,7 @@ if ($present) { Info "OpenRouter key present in this session (OPENROUTER_API_KEY
 else { Info "no VLM key in this session - set OPENROUTER_API_KEY then re-run this script" }
 if (-not $env:VLM_PROVIDER) { $env:VLM_PROVIDER = 'openrouter' }
 if (-not $env:OPENROUTER_BASE_URL) { $env:OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1' }
-if ($env:VLM_PROVIDER -eq 'openrouter' -and -not $env:VLM_MODEL) { $env:VLM_MODEL = 'google/gemini-3.6-flash' }
+if ($env:VLM_PROVIDER -eq 'openrouter' -and -not $env:VLM_MODEL) { $env:VLM_MODEL = 'openrouter/free' }
 if (-not $env:VLM_BASE_URL) { $env:VLM_BASE_URL = $env:OPENROUTER_BASE_URL }
 Info "VLM_PROVIDER=$env:VLM_PROVIDER  model=$env:VLM_MODEL"
 
